@@ -26,7 +26,7 @@ except ImportError:
 
 # ضع توكن البوت هنا بين علامتي الاقتباس، ثم شغّل الملف مباشرة.
 # مثال: BOT_TOKEN = "1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-BOT_TOKEN = "8206346405:AAEAzKxVJGpHqoom2ZNcSpHsPiq3qJHQDW8"
+BOT_TOKEN = "8734979074:AAEdPkSfjUBQzvnAPfqhR_heMdTyWJwBLDw"
 
 # صفر = بلا حد حجم داخلي. تبقى حدود Telegram وموارد الخادم قائمة.
 MAX_FILE_SIZE_MB = 0
