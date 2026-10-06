@@ -26,7 +26,7 @@ except ImportError:
 
 # ضع توكن البوت هنا بين علامتي الاقتباس، ثم شغّل الملف مباشرة.
 # مثال: BOT_TOKEN = "1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-BOT_TOKEN = "8734979074:AAEdPkSfjUBQzvnAPfqhR_heMdTyWJwBLDw"
+BOT_TOKEN = "8695860206:AAHL-FDu68ci0Fw_us3qC7vXJohc_RqP-38"
 # اكتب اسم أو يوزر البوت هنا ليظهر في اسم ملف الصوت.
 BOT_USERNAME = "@shoo_sbot"
 DEVELOPER_USERNAME = "@to_ls"
