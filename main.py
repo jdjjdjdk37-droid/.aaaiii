@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 import telebot
@@ -27,6 +27,9 @@ except ImportError:
 # ضع توكن البوت هنا بين علامتي الاقتباس، ثم شغّل الملف مباشرة.
 # مثال: BOT_TOKEN = "1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 BOT_TOKEN = "8734979074:AAEdPkSfjUBQzvnAPfqhR_heMdTyWJwBLDw"
+# اكتب اسم أو يوزر البوت هنا ليظهر في اسم ملف الصوت.
+BOT_USERNAME = "@shoo_sbot"
+DEVELOPER_USERNAME = "@to_ls"
 
 # صفر = بلا حد حجم داخلي. تبقى حدود Telegram وموارد الخادم قائمة.
 MAX_FILE_SIZE_MB = 0
@@ -52,7 +55,9 @@ URL_RE = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac"}
-DOWNLOAD_QUEUE: queue.Queue = queue.Queue()
+USER_QUEUES: dict[int, queue.Queue] = {}
+USER_WORKERS: dict[int, threading.Thread] = {}
+USER_QUEUES_LOCK = threading.Lock()
 MEDIA_ACTIONS: dict[str, tuple[int, str, float]] = {}
 MEDIA_ACTIONS_LOCK = threading.Lock()
 
@@ -86,8 +91,8 @@ def is_showgram_url(url: str) -> bool:
     return host.endswith("showgram.app") or host.endswith("demoda.app")
 
 
-def download_showgram(url: str, folder: str) -> tuple[Path, str]:
-    """يجلب videoUrl الأصلي من API الرسمي بدل نسخة download المائية."""
+def get_showgram_media(url: str) -> tuple[str, str]:
+    """يجلب رابط الوسائط الأصلي من API الرسمي دون تنزيله على الخادم."""
     if not SHOWGRAM_AUTH_TOKEN.strip():
         raise RuntimeError(showgram_hint(url))
     match = re.search(r"/r/([A-Za-z0-9_-]+)", urlparse(url).path)
@@ -133,6 +138,12 @@ def download_showgram(url: str, folder: str) -> tuple[Path, str]:
                     break
     if not media_url:
         raise RuntimeError("لم يُرجع Showgram رابط الفيديو الأصلي لهذا الريل")
+    return media_url, reel.get("caption") or reel.get("title") or "Showgram Reel"
+
+
+def download_showgram(url: str, folder: str) -> tuple[Path, str]:
+    """Fallback: تنزيل رابط Showgram الأصلي محليًا إذا رفض Telegram الرابط المباشر."""
+    media_url, title = get_showgram_media(url)
     media_response = requests.get(
         media_url,
         headers={"User-Agent": "Showgram/1.0.18 (Linux;Android)"},
@@ -141,7 +152,7 @@ def download_showgram(url: str, folder: str) -> tuple[Path, str]:
     )
     media_response.raise_for_status()
     path, _ = stream_media(media_url, media_response, folder)
-    return path, reel.get("caption") or reel.get("title") or "Showgram Reel"
+    return path, title
 
 
 def download_with_ytdlp(url: str, folder: str) -> tuple[Path, str]:
@@ -265,27 +276,100 @@ def remember_media_action(user_id: int, source_url: str) -> str:
     return token
 
 
-def send_result(chat_id: int, path: Path, title: str, source_url: str | None = None):
+def media_keyboard(chat_id: int, source_url: str):
+    keyboard = types.InlineKeyboardMarkup()
+    action = remember_media_action(chat_id, source_url)
+    keyboard.row(
+        types.InlineKeyboardButton("🎵 MP3", callback_data=f"audio:{action}"),
+        types.InlineKeyboardButton("🎙 رسالة صوتية", callback_data=f"voice:{action}"),
+    )
+    return keyboard
+
+
+def send_result(
+    chat_id: int,
+    path: Path,
+    title: str,
+    source_url: str | None = None,
+    send_as_voice: bool = False,
+    caption: str | None = None,
+):
     size = path.stat().st_size
     if MAX_FILE_SIZE and size > MAX_FILE_SIZE:
         raise ValueError(f"حجم الملف أكبر من الحد المسموح ({MAX_FILE_SIZE_MB} MB)")
     ext = path.suffix.lower()
     keyboard = None
     if ext in VIDEO_EXTS and source_url:
-        keyboard = types.InlineKeyboardMarkup()
-        action = remember_media_action(chat_id, source_url)
-        keyboard.add(types.InlineKeyboardButton("🎵 استخراج الصوت", callback_data=f"audio:{action}"))
+        keyboard = media_keyboard(chat_id, source_url)
     with path.open("rb") as media:
         if ext in VIDEO_EXTS:
             return bot.send_video(
-                chat_id, media, supports_streaming=True, reply_markup=keyboard, timeout=DOWNLOAD_TIMEOUT
+                chat_id, media, supports_streaming=True, reply_markup=keyboard,
+                caption=caption, timeout=DOWNLOAD_TIMEOUT,
             )
         elif ext in IMAGE_EXTS:
-            return bot.send_photo(chat_id, media, timeout=DOWNLOAD_TIMEOUT)
+            return bot.send_photo(chat_id, media, caption=caption, timeout=DOWNLOAD_TIMEOUT)
         elif ext in AUDIO_EXTS:
-            return bot.send_audio(chat_id, media, timeout=DOWNLOAD_TIMEOUT)
+            if send_as_voice:
+                return bot.send_voice(chat_id, media, caption=caption, timeout=DOWNLOAD_TIMEOUT)
+            return bot.send_audio(chat_id, media, caption=caption, timeout=DOWNLOAD_TIMEOUT)
         else:
-            return bot.send_document(chat_id, media, timeout=DOWNLOAD_TIMEOUT)
+            return bot.send_document(chat_id, media, caption=caption, timeout=DOWNLOAD_TIMEOUT)
+
+
+def send_direct_result(chat_id: int, media_url: str, source_url: str, caption: str | None = None):
+    """يجعل Telegram يسحب الملف من CDN مباشرة بدل مرور الملف على الخادم."""
+    suffix = Path(urlparse(media_url).path).suffix.lower()
+    if suffix in IMAGE_EXTS:
+        return bot.send_photo(chat_id, media_url, caption=caption, timeout=DOWNLOAD_TIMEOUT)
+    if suffix in AUDIO_EXTS:
+        return bot.send_audio(chat_id, media_url, caption=caption, timeout=DOWNLOAD_TIMEOUT)
+    return bot.send_video(
+        chat_id,
+        media_url,
+        supports_streaming=True,
+        reply_markup=media_keyboard(chat_id, source_url),
+        caption=caption,
+        timeout=DOWNLOAD_TIMEOUT,
+    )
+
+
+def format_size(size: int | None) -> str:
+    if not size or size <= 0:
+        return "غير متاح"
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return "غير متاح"
+
+
+def file_name_from_url(media_url: str, fallback: str = "Showgram_Reel") -> str:
+    raw_name = Path(unquote(urlparse(media_url).path)).name
+    if not raw_name or raw_name in ("/", "."):
+        raw_name = fallback
+    return safe_name(raw_name)
+
+
+def build_file_caption(
+    title: str,
+    extension: str,
+    size: int | None = None,
+    file_name: str | None = None,
+    description: str | None = None,
+) -> str:
+    description_line = (
+        f"\nالوصف: {html.escape(description[:1000])}"
+        if description and description.strip()
+        else ""
+    )
+    return (
+        "<b>ℹ️ معلومات الملف</b>\n"
+        f"<blockquote>النوع: {html.escape(extension.upper().lstrip('.') or 'FILE')}\n"
+        f"الحجم: {format_size(size)}{description_line}</blockquote>\n"
+        f"👨‍💻 المطور: {html.escape(DEVELOPER_USERNAME)}"
+    )
 
 
 def animate_status(chat_id: int, message_id: int, stop_event: threading.Event) -> None:
@@ -321,6 +405,27 @@ def process_message(message: types.Message, url: str) -> None:
     animation.start()
     folder = tempfile.mkdtemp(prefix="telegram-media-")
     try:
+        if is_showgram_url(url):
+            media_url, title = get_showgram_media(url)
+            try:
+                stop_animation.set()
+                bot.edit_message_text(
+                    "<b>⚡ رابط مباشر جاهز</b>\n<blockquote>📤 جاري الإرسال السريع...</blockquote>",
+                    message.chat.id,
+                    status.id,
+                )
+                direct_caption = build_file_caption(
+                    title,
+                    Path(urlparse(media_url).path).suffix,
+                    file_name=file_name_from_url(media_url),
+                    description=title,
+                )
+                send_direct_result(message.chat.id, media_url, url, caption=direct_caption)
+                bot.delete_message(message.chat.id, status.id)
+                return
+            except Exception as direct_error:
+                logger.info("Direct Telegram delivery failed; using local fallback: %s", direct_error)
+                stop_animation.clear()
         path, title = fetch_media(url, folder)
         stop_animation.set()
         bot.edit_message_text(
@@ -328,7 +433,14 @@ def process_message(message: types.Message, url: str) -> None:
             message.chat.id,
             status.id,
         )
-        send_result(message.chat.id, path, title, source_url=url)
+        local_caption = build_file_caption(
+            title,
+            path.suffix,
+            size=path.stat().st_size,
+            file_name=path.name,
+            description=title if is_showgram_url(url) else None,
+        )
+        send_result(message.chat.id, path, title, source_url=url, caption=local_caption)
         bot.delete_message(message.chat.id, status.id)
     except ValueError as exc:
         stop_animation.set()
@@ -345,9 +457,10 @@ def process_message(message: types.Message, url: str) -> None:
         shutil.rmtree(folder, ignore_errors=True)
 
 
-def extract_audio(url: str, folder: str) -> Path:
+def extract_audio(url: str, folder: str, as_voice: bool = False) -> Path:
     source_path, _ = fetch_media(url, folder)
-    audio_path = Path(folder) / "audio.mp3"
+    brand = safe_name(BOT_USERNAME.lstrip("@"), "ShowgramBot")
+    audio_path = Path(folder) / (f"{brand}_voice.ogg" if as_voice else f"{brand}_audio.mp3")
     if not Path(FFMPEG_BINARY).exists() and not shutil.which(FFMPEG_BINARY):
         raise RuntimeError(
             "أداة FFmpeg غير متوفرة. شغّل pip install -r requirements.txt ثم أعد المحاولة."
@@ -355,7 +468,9 @@ def extract_audio(url: str, folder: str) -> Path:
     result = subprocess.run(
         [
             FFMPEG_BINARY, "-y", "-i", str(source_path), "-vn",
-            "-codec:a", "libmp3lame", "-q:a", "2", str(audio_path),
+            *(["-codec:a", "libopus", "-b:a", "48k", "-vbr", "on", "-application", "voip"]
+              if as_voice else ["-codec:a", "libmp3lame", "-q:a", "2"]),
+            str(audio_path),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -367,17 +482,21 @@ def extract_audio(url: str, folder: str) -> Path:
     return audio_path
 
 
-def process_audio(message: types.Message, url: str) -> None:
+def process_audio(message: types.Message, url: str, as_voice: bool = False) -> None:
+    label = "رسالة صوتية" if as_voice else "ملف MP3"
     status = bot.reply_to(
         message,
-        "<b>🎵 جاري استخراج الصوت...</b>\n"
-        "<blockquote>سيتم إرسال ملف MP3 بعد اكتمال المعالجة.</blockquote>",
+        f"<b>🎵 جاري تجهيز {label}...</b>\n"
+        f"<blockquote>سيتم إرسال {label} بعد اكتمال المعالجة.</blockquote>",
     )
     folder = tempfile.mkdtemp(prefix="telegram-audio-")
     try:
-        path = extract_audio(url, folder)
+        path = extract_audio(url, folder, as_voice=as_voice)
         bot.edit_message_text("<b>✅ تم استخراج الصوت</b>\n<blockquote>📤 جاري الإرسال...</blockquote>", message.chat.id, status.id)
-        send_result(message.chat.id, path, "Audio")
+        audio_caption = build_file_caption(
+            "Audio", path.suffix, path.stat().st_size, file_name=path.name
+        )
+        send_result(message.chat.id, path, "Audio", send_as_voice=as_voice, caption=audio_caption)
         bot.delete_message(message.chat.id, status.id)
     except Exception as exc:
         logger.exception("Audio extraction failed")
@@ -390,23 +509,59 @@ def process_audio(message: types.Message, url: str) -> None:
         shutil.rmtree(folder, ignore_errors=True)
 
 
-def queue_worker() -> None:
+def user_queue_worker(user_id: int, user_queue: queue.Queue) -> None:
     while True:
-        task_type, message, url = DOWNLOAD_QUEUE.get()
+        task_type, message, url = user_queue.get()
         try:
-            if task_type == "audio":
-                process_audio(message, url)
+            if task_type in ("audio", "voice"):
+                process_audio(message, url, as_voice=(task_type == "voice"))
             else:
                 process_message(message, url)
         except Exception:
             logger.exception("Queue task failed")
         finally:
-            DOWNLOAD_QUEUE.task_done()
+            user_queue.task_done()
+            with USER_QUEUES_LOCK:
+                if user_queue.empty():
+                    USER_QUEUES.pop(user_id, None)
+                    USER_WORKERS.pop(user_id, None)
+                    return
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("audio:"))
+def enqueue_task(user_id: int, task_type: str, message: types.Message, url: str) -> None:
+    with USER_QUEUES_LOCK:
+        user_queue = USER_QUEUES.setdefault(user_id, queue.Queue())
+        user_queue.put((task_type, message, url))
+        worker = USER_WORKERS.get(user_id)
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(
+                target=user_queue_worker,
+                args=(user_id, user_queue),
+                daemon=True,
+                name=f"download-user-{user_id}",
+            )
+            USER_WORKERS[user_id] = worker
+            worker.start()
+
+
+def cleanup_temp_files() -> None:
+    temp_root = Path(tempfile.gettempdir())
+    prefixes = ("telegram-media-", "telegram-audio-")
+    while True:
+        now = time.time()
+        for prefix in prefixes:
+            for path in temp_root.glob(prefix + "*"):
+                try:
+                    if path.is_dir() and now - path.stat().st_mtime > 3600:
+                        shutil.rmtree(path, ignore_errors=True)
+                except OSError:
+                    pass
+        time.sleep(1800)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("audio:", "voice:")))
 def audio_button(call: types.CallbackQuery) -> None:
-    token = call.data.split(":", 1)[1]
+    mode, token = call.data.split(":", 1)
     with MEDIA_ACTIONS_LOCK:
         action = MEDIA_ACTIONS.get(token)
         if action and action[2] < time.time():
@@ -419,8 +574,8 @@ def audio_button(call: types.CallbackQuery) -> None:
     if call.from_user.id != owner_id:
         bot.answer_callback_query(call.id, "هذا الزر ليس خاصًا بك.", show_alert=True)
         return
-    DOWNLOAD_QUEUE.put(("audio", call.message, url))
-    bot.answer_callback_query(call.id, "🎵 سيتم إرسال الصوت بعد قليل")
+    enqueue_task(call.from_user.id, mode, call.message, url)
+    bot.answer_callback_query(call.id, "🎵 سيتم تجهيز الصوت بعد قليل")
 
 
 @bot.message_handler(commands=["start", "help"])
@@ -432,7 +587,7 @@ def welcome(message: types.Message) -> None:
         "<b>طريقة الاستخدام:</b>\n"
         "1) أرسل الرابط.\n"
         "2) انتظر اكتمال التحميل.\n"
-        "3) اضغط <b>🎵 استخراج الصوت</b> إذا أردت MP3.\n\n"
+        "3) اختر <b>🎵 MP3</b> أو <b>🎙 رسالة صوتية</b> أسفل الفيديو.\n\n"
         "<b>يدعم:</b> الفيديو، الصور، الصوت، والملفات.\n"
         "<i>لا يدعم الحسابات الخاصة أو DRM أو الروابط التي تتطلب صلاحيات غير متوفرة.</i>",
     )
@@ -444,10 +599,10 @@ def handle_text(message: types.Message) -> None:
     if not url:
         bot.reply_to(message, "أرسل رابطًا يبدأ بـ http:// أو https://")
         return
-    DOWNLOAD_QUEUE.put(("video", message, url))
+    enqueue_task(message.from_user.id, "video", message, url)
 
 
 if __name__ == "__main__":
-    threading.Thread(target=queue_worker, daemon=True, name="download-queue-worker").start()
+    threading.Thread(target=cleanup_temp_files, daemon=True, name="temp-cleaner").start()
     logger.info("Bot is running")
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
